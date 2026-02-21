@@ -1,18 +1,15 @@
 import os
 import sys
+import time
 import argparse
 import subprocess
 import shutil
 import json
-import re
 import warnings
-from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-# Suppress the Gemini SDK warning that fires when a response contains mixed
-# function_call + text parts and you inspect any property of the response.
 warnings.filterwarnings("ignore", message=".*non-text parts.*")
 
 from functions.get_file_content import get_file_content, schema_get_file_content
@@ -21,11 +18,44 @@ from functions.get_files_info import get_files_info, schema_get_files_info
 from functions.run_python_file import run_python_file, schema_run_python_file
 
 
+# ─────────────────────────── ANSI colour helpers ──────────────────────────────
+
+class C:
+    _tty = sys.stdout.isatty()
+    @staticmethod
+    def _w(code, text): return f"{code}{text}\033[0m" if C._tty else text
+    bold    = staticmethod(lambda t: C._w("\033[1m",    t))
+    dim     = staticmethod(lambda t: C._w("\033[2m",    t))
+    green   = staticmethod(lambda t: C._w("\033[32m",   t))
+    cyan    = staticmethod(lambda t: C._w("\033[36m",   t))
+    yellow  = staticmethod(lambda t: C._w("\033[33m",   t))
+    blue    = staticmethod(lambda t: C._w("\033[34m",   t))
+    magenta = staticmethod(lambda t: C._w("\033[35m",   t))
+    red     = staticmethod(lambda t: C._w("\033[31m",   t))
+    grey    = staticmethod(lambda t: C._w("\033[90m",   t))
+    b_green = staticmethod(lambda t: C._w("\033[1;32m", t))
+    b_cyan  = staticmethod(lambda t: C._w("\033[1;36m", t))
+    b_blue  = staticmethod(lambda t: C._w("\033[1;34m", t))
+
+TOOL_ICONS = {
+    "get_files_info":           "📂",
+    "get_file_content":         "📄",
+    "write_file":               "✏️ ",
+    "run_python_file":          "🐍",
+    "run_bash_command":         "⚡",
+    "grep_in_files":            "🔍",
+    "delete_file_or_directory": "🗑️ ",
+    "create_directory":         "📁",
+    "install_package":          "📦",
+}
+
+WIDTH = 64
+
 # ─────────────────────────── Configuration ────────────────────────────────────
 
 WORKING_DIRECTORY = os.path.abspath(".")
-DEFAULT_MODEL = "gemini-2.5-flash"
-MAX_ITERATIONS = 30
+DEFAULT_MODEL     = "gemini-2.5-pro"
+MAX_ITERATIONS    = 30
 
 SYSTEM_PROMPT = """
 You are an expert software engineer and coding assistant. Your job is to help
@@ -42,340 +72,374 @@ Capabilities:
   - Delete files or directories
   - Create directories
 
-CRITICAL RULES — follow these exactly:
-  1. Start by Creating a Project Folder and put every file in that folder 
-  2. Do NOT describe what you are about to do in text before doing it with tools use the[Thinking...].
-  3. Only output plain text when the ENTIRE task is fully complete and verified.
-  4. After writing code always run it to verify it works; fix any errors found.
-  5. Write a test to verify the process
+CRITICAL RULES:
+  1. Start by Creating a Project Folder and put every file in that folder  
+   After creating a project folder, IMMEDIATELY call change_directory to
+     switch into it before writing any files or running any commands
+
+  2. NEVER write a plan or explanation before acting. Start EVERY response with
+     a tool call. Think, then immediately call the tool.
+  3. Do NOT describe what you are about to do before doing it with tools.
+  4. Only output plain text when the ENTIRE task is fully complete and verified.
+  5. After writing code, always run it to verify it works; fix any errors found.
   6. All paths must be relative to the working directory (injected automatically).
-  7. Iterate: write → run → observe → fix until the task is done.
-  8. Stop execution if you are done early 
-  7. When the task is 100% complete, output a short summary of what was built .
-  8. Write a readme for the project and steps for executing the project
+  7. Iterate: write -> run -> observe -> fix until the task is done.
+  8 .Finally use Write README for the project.
 """
 
-
-# ─────────────────────────── Extra Tool Functions ─────────────────────────────
+# ─────────────────────────── Tool Implementations ─────────────────────────────
 
 def run_bash_command(command: str, working_directory: str, timeout: int = 30) -> str:
-    """Run an arbitrary shell command and return combined stdout + stderr."""
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=working_directory,
-            timeout=timeout,
-        )
-        output = result.stdout
-        if result.stderr:
-            output += "\nSTDERR:\n" + result.stderr
-        if result.returncode != 0:
-            output += f"\n[Exit code: {result.returncode}]"
-        return output or "(no output)"
+        r = subprocess.run(command, shell=True, capture_output=True, text=True,
+                           cwd=working_directory, timeout=timeout)
+        out = r.stdout
+        if r.stderr:   out += "\nSTDERR:\n" + r.stderr
+        if r.returncode != 0: out += f"\n[Exit code: {r.returncode}]"
+        return out or "(no output)"
     except subprocess.TimeoutExpired:
-        return f"[Error] Command timed out after {timeout} seconds."
+        return f"[Error] Timed out after {timeout}s."
     except Exception as e:
         return f"[Error] {e}"
-
 
 def grep_in_files(pattern: str, path: str, working_directory: str,
                   recursive: bool = True, case_sensitive: bool = True) -> str:
-    """Search for a regex pattern in files under `path`."""
     try:
-        flags = "" if case_sensitive else " -i"
+        flags  = "" if case_sensitive else " -i"
         r_flag = " -r" if recursive else ""
-        full_path = os.path.join(working_directory, path)
-        cmd = f"grep{r_flag}{flags} -n --include='*.py' --include='*.txt' --include='*.md' --include='*.sh' -E {json.dumps(pattern)} {json.dumps(full_path)}"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        return result.stdout or "(no matches found)"
+        exts   = "--include='*.py' --include='*.txt' --include='*.md' --include='*.sh'"
+        full   = os.path.join(working_directory, path)
+        cmd    = f"grep{r_flag}{flags} -n {exts} -E {json.dumps(pattern)} {json.dumps(full)}"
+        r      = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return r.stdout or "(no matches found)"
     except Exception as e:
         return f"[Error] {e}"
-
 
 def delete_file_or_directory(path: str, working_directory: str) -> str:
-    """Delete a file or directory (recursively)."""
     try:
-        full_path = os.path.join(working_directory, path)
-        if not os.path.exists(full_path):
-            return f"[Error] Path does not exist: {path}"
-        if os.path.isdir(full_path):
-            shutil.rmtree(full_path)
-            return f"Deleted directory: {path}"
-        else:
-            os.remove(full_path)
-            return f"Deleted file: {path}"
+        full = os.path.join(working_directory, path)
+        if not os.path.exists(full): return f"[Error] Not found: {path}"
+        shutil.rmtree(full) if os.path.isdir(full) else os.remove(full)
+        return f"Deleted: {path}"
     except Exception as e:
         return f"[Error] {e}"
-
 
 def create_directory(path: str, working_directory: str) -> str:
-    """Create a directory (including all intermediate directories)."""
     try:
-        full_path = os.path.join(working_directory, path)
-        os.makedirs(full_path, exist_ok=True)
-        return f"Created directory: {path}"
+        os.makedirs(os.path.join(working_directory, path), exist_ok=True)
+        return f"Created: {path}"
     except Exception as e:
         return f"[Error] {e}"
+def change_directory(path: str, working_directory: str) -> str:
+    """Switch the agent working directory to path (relative or absolute)."""
+    global WORKING_DIRECTORY
+    candidate = path if os.path.isabs(path) else os.path.join(working_directory, path)
+    candidate = os.path.normpath(candidate)
+    if not os.path.isdir(candidate):
+        return f"[Error] Not a directory: {candidate}"
+    WORKING_DIRECTORY = candidate
+    return f"Working directory changed to: {WORKING_DIRECTORY}"
+
 
 
 def install_package(package: str, working_directory: str) -> str:
-    """Install a Python package via pip."""
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", package],
-        capture_output=True, text=True
-    )
-    output = result.stdout + result.stderr
-    return output or "(no output)"
+    r = subprocess.run([sys.executable, "-m", "pip", "install", package],
+                       capture_output=True, text=True)
+    return (r.stdout + r.stderr) or "(no output)"
+
+# ─────────────────────────── Tool Schemas ─────────────────────────────────────
 
 schema_run_bash_command = types.FunctionDeclaration(
     name="run_bash_command",
-    description=(
-        "Run an arbitrary shell/bash command in the working directory. "
-        "Use for installing packages, running tests, git commands, compiling, etc."
-    ),
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "command": types.Schema(type=types.Type.STRING, description="The shell command to execute."),
-            "timeout": types.Schema(type=types.Type.INTEGER, description="Timeout in seconds (default 30)."),
-        },
-        required=["command"],
-    ),
+    description="Run an arbitrary shell command in the working directory.",
+    parameters=types.Schema(type=types.Type.OBJECT, properties={
+        "command": types.Schema(type=types.Type.STRING, description="Shell command."),
+        "timeout": types.Schema(type=types.Type.INTEGER, description="Timeout in seconds."),
+    }, required=["command"]),
 )
-
 schema_grep_in_files = types.FunctionDeclaration(
     name="grep_in_files",
-    description="Search for a regex pattern inside files. Useful for finding usages, imports, or errors.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "pattern": types.Schema(type=types.Type.STRING, description="Regex pattern to search for."),
-            "path": types.Schema(type=types.Type.STRING, description="Directory or file path to search in."),
-            "recursive": types.Schema(type=types.Type.BOOLEAN, description="Search recursively (default true)."),
-            "case_sensitive": types.Schema(type=types.Type.BOOLEAN, description="Case-sensitive search (default true)."),
-        },
-        required=["pattern", "path"],
-    ),
+    description="Search for a regex pattern inside files.",
+    parameters=types.Schema(type=types.Type.OBJECT, properties={
+        "pattern":        types.Schema(type=types.Type.STRING,  description="Regex pattern."),
+        "path":           types.Schema(type=types.Type.STRING,  description="Directory or file."),
+        "recursive":      types.Schema(type=types.Type.BOOLEAN, description="Recurse (default true)."),
+        "case_sensitive": types.Schema(type=types.Type.BOOLEAN, description="Case-sensitive (default true)."),
+    }, required=["pattern", "path"]),
 )
-
 schema_delete_file_or_directory = types.FunctionDeclaration(
     name="delete_file_or_directory",
-    description="Delete a file or directory (recursively for directories). Use with caution.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "path": types.Schema(type=types.Type.STRING, description="Relative path to the file or directory to delete."),
-        },
-        required=["path"],
-    ),
+    description="Delete a file or directory recursively.",
+    parameters=types.Schema(type=types.Type.OBJECT, properties={
+        "path": types.Schema(type=types.Type.STRING, description="Relative path to delete."),
+    }, required=["path"]),
 )
-
 schema_create_directory = types.FunctionDeclaration(
     name="create_directory",
-    description="Create a new directory (and any necessary parent directories).",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "path": types.Schema(type=types.Type.STRING, description="Relative path of the directory to create."),
-        },
-        required=["path"],
-    ),
+    description="Create a directory including all parents.",
+    parameters=types.Schema(type=types.Type.OBJECT, properties={
+        "path": types.Schema(type=types.Type.STRING, description="Relative path to create."),
+    }, required=["path"]),
 )
-
 schema_install_package = types.FunctionDeclaration(
     name="install_package",
-    description="Install a Python package using pip.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "package": types.Schema(type=types.Type.STRING, description="Package name (e.g. 'torch', 'numpy==1.25')."),
-        },
-        required=["package"],
-    ),
+    description="Install a Python package via pip.",
+    parameters=types.Schema(type=types.Type.OBJECT, properties={
+        "package": types.Schema(type=types.Type.STRING, description="Package name, e.g. 'fastapi'."),
+    }, required=["package"]),
 )
 
+schema_change_directory = types.FunctionDeclaration(
+    name="change_directory",
+    description=(
+        "Change the agent working directory into a subdirectory. "
+        "Call this immediately after creating a project folder so all "
+        "subsequent file and shell operations run inside it."
+    ),
+    parameters=types.Schema(type=types.Type.OBJECT, properties={
+        "path": types.Schema(type=types.Type.STRING,
+                             description="Relative or absolute path to switch into."),
+    }, required=["path"]),
+)
 
-# ─────────────────────────── Function Dispatcher ──────────────────────────────
+# ─────────────────────────── Dispatcher ───────────────────────────────────────
 
 FUNCTION_MAP = {
-    "get_files_info":          get_files_info,
-    "get_file_content":        get_file_content,
-    "run_python_file":         run_python_file,
-    "write_file":              write_file,
-    "run_bash_command":        run_bash_command,
-    "grep_in_files":           grep_in_files,
+    "get_files_info":           get_files_info,
+    "get_file_content":         get_file_content,
+    "run_python_file":          run_python_file,
+    "write_file":               write_file,
+    "run_bash_command":         run_bash_command,
+    "grep_in_files":            grep_in_files,
     "delete_file_or_directory": delete_file_or_directory,
-    "create_directory":        create_directory,
-    "install_package":         install_package,
+    "create_directory":         create_directory,
+    "install_package":          install_package,
+    "change_directory":         change_directory
 }
 
-AVAILABLE_TOOLS = types.Tool(
-    function_declarations=[
-        schema_get_file_content,
-        schema_get_files_info,
-        schema_write_file,
-        schema_run_python_file,
-        schema_run_bash_command,
-        schema_grep_in_files,
-        schema_delete_file_or_directory,
-        schema_create_directory,
-        schema_install_package,
-    ]
-)
+AVAILABLE_TOOLS = types.Tool(function_declarations=[
+    schema_get_file_content, schema_get_files_info, schema_write_file,
+    schema_run_python_file, schema_run_bash_command, schema_grep_in_files,
+    schema_delete_file_or_directory, schema_create_directory, schema_install_package,
+    schema_change_directory
+])
 
 
-def call_function(func_call_part, verbose: bool = False) -> types.Content:
-    """Dispatch a function call from the model and return a tool-role Content."""
-    func_name = func_call_part.name
+def _wrap(text: str, indent: int = 4) -> str:
+    """Word-wrap text to WIDTH, indented by `indent` spaces."""
+    pad   = " " * indent
+    words = text.split()
+    line, lines = "", []
+    for w in words:
+        if len(line) + len(w) + 1 > WIDTH - indent:
+            if line: lines.append(pad + line)
+            line = w
+        else:
+            line = (line + " " + w).strip()
+    if line: lines.append(pad + line)
+    return "\n".join(lines)
+
+
+def call_function(func_call, verbose: bool = False) -> types.Content:
+    """
+    Execute a single tool call requested by the model.
+    """
+    name = func_call.name
+    args = dict(func_call.args)
+    icon = TOOL_ICONS.get(name, "🔧")
+
+    # Key arg preview (first value, truncated)
+    preview = ""
+    if args:
+        first_val = str(next(iter(args.values())))
+        preview = first_val[:52] + ("…" if len(first_val) > 52 else "")
+
+    print(f"  {icon}  {C.b_cyan(name)}  {C.grey(repr(preview))}" if not verbose
+          else f"  {icon}  {C.b_cyan(name)}")
     if verbose:
-        print(f"  ↳ [{func_name}] args={dict(func_call_part.args)}")
-    else:
-        print(f"  ↳ calling: {func_name}()")
+        for k, v in args.items():
+            v_str = str(v)
+            if len(v_str) > 80: v_str = v_str[:77] + "…"
+            print(f"       {C.grey(k + ':')} {C.cyan(v_str)}")
 
-    if func_name not in FUNCTION_MAP:
-        response = {"error": f"Function '{func_name}' is not implemented."}
+    t0 = time.monotonic()
+    if name not in FUNCTION_MAP:
+        result  = f"[Error] Unknown tool: {name}"
+        success = False
     else:
-        args = dict(func_call_part.args)
-        args["working_directory"] = WORKING_DIRECTORY
         try:
-            result = FUNCTION_MAP[func_name](**args)
-            response = {"result": result}
+            result  = FUNCTION_MAP[name](**{**args, "working_directory": WORKING_DIRECTORY})
+            success = not str(result).startswith("[Error]")
         except Exception as e:
-            response = {"error": str(e)}
+            result  = f"[Error] {e}"
+            success = False
+
+    elapsed     = time.monotonic() - t0
+    status      = C.green("✓") if success else C.red("✗")
+    elapsed_str = C.grey(f"{elapsed:.2f}s")
 
     if verbose:
-        preview = str(response)[:300]
-        print(f"     → {preview}{'...' if len(str(response)) > 300 else ''}")
+        out = str(result)
+        if len(out) > 500: out = out[:497] + "…"
+        print(f"     {status} {elapsed_str}")
+        for ln in out.splitlines()[:20]:
+            print(C.grey(f"       {ln}"))
+        if len(str(result).splitlines()) > 20:
+            print(C.grey("       … (truncated)"))
+    else:
+        first_line = str(result).splitlines()[0] if result else "(no output)"
+        if len(first_line) > 72: first_line = first_line[:69] + "…"
+        print(f"     {status} {C.grey(first_line)}  {elapsed_str}")
 
-    return types.Content(
-        role="tool",
-        parts=[
-            types.Part.from_function_response(name=func_name, response=response)
-        ],
-    )
+    return types.Content(role="tool", parts=[
+        types.Part.from_function_response(name=name, response={"result": result})
+    ])
 
 
 # ─────────────────────────── Agent Loop ───────────────────────────────────────
 
-def run_agent(client: genai.Client, user_prompt: str, model: str, verbose: bool,
+def run_agent(client, user_prompt: str, model: str, verbose: bool,
               max_iterations: int = MAX_ITERATIONS) -> None:
-    """Main agentic loop: sends messages, handles tool calls, repeats until done."""
-
-    messages = [
-        types.Content(role="user", parts=[types.Part(text=user_prompt)])
-    ]
-
-    config = types.GenerateContentConfig(
+    messages = [types.Content(role="user", parts=[types.Part(text=user_prompt)])]
+    config   = types.GenerateContentConfig(
         tools=[AVAILABLE_TOOLS],
         system_instruction=SYSTEM_PROMPT,
+        candidate_count=1,  # always 1; we use candidates[0] deterministically
     )
 
-    print(f"\n{'─'*60}")
-    print(f"Agent starting  |  model: {model}  |  max_iter: {max_iterations}")
-    print(f"{'─'*60}\n")
+    # ── Session header ────────────────────────────────────────────────────────
+    print()
+    print(C.grey("─" * WIDTH))
+    print(f"  {C.b_blue('◆ Coding Agent')}  {C.grey(model)}")
+    print(C.grey("─" * WIDTH))
+    task_preview = user_prompt if len(user_prompt) <= WIDTH - 10 else user_prompt[:WIDTH - 13] + "…"
+    print(f"  {C.bold('Task')}  {task_preview}")
+    print(C.grey("─" * WIDTH))
+    print()
+
+    start = time.monotonic()
 
     for iteration in range(1, max_iterations + 1):
-        print(f"[Iteration {iteration}/{max_iterations}]")
+        step_label = C.grey(f"  step {iteration}")
+        divider    = C.grey(" ─" * ((WIDTH - 10) // 2))
+        print(f"{step_label}{divider}")
 
         try:
             response = client.models.generate_content(
-                model=model,
-                contents=messages,
-                config=config,
+                model=model, contents=messages, config=config,
             )
         except Exception as e:
-            print(f"[API Error] {e}")
+            print(f"\n  {C.red('✗ API Error:')} {e}\n")
             break
 
         if verbose:
-            meta = response.usage_metadata
-            print(f"  tokens — prompt: {meta.prompt_token_count}, response: {meta.candidates_token_count}")
+            m = response.usage_metadata
+            print(C.grey(f" ↳ {m.prompt_token_count} prompt tokens / {m.candidates_token_count} response tokens"))
 
-        # Parse parts directly from the candidate to avoid the SDK
-        # "non-text parts in the response" warning that fires when you
-        # access response.text on a mixed function_call + text response.
-        candidate = response.candidates[0]
+        # ── Parse candidate[0] parts ──────────────────────────────────────────
+        # We always use candidates[0] — see call_function docstring for rationale.
+        candidate           = response.candidates[0]
         messages.append(candidate.content)
 
-        # Separate parts by type
-        function_call_parts = [
-            p for p in candidate.content.parts if p.function_call is not None
-        ]
-        text_parts = [
-            p.text for p in candidate.content.parts
-            if p.text is not None and p.function_call is None
-        ]
+        function_call_parts = [p for p in candidate.content.parts if p.function_call is not None]
+        text_parts          = [p.text for p in candidate.content.parts
+                               if p.text is not None and p.function_call is None]
 
-        # ── Tool calls take priority ──────────────────────────────────────────
-        # The model sometimes emits a text "plan" in the same turn as tool
-        # calls. We ALWAYS process function calls when present — any
-        # accompanying text is shown as live commentary, NOT a final answer.
+        # ── Branch A: tool calls ───────────────────────────────────────────────
+        # Text alongside a tool call = model reasoning, shown as "thinking".
+        # We NEVER treat this as the final answer — only tool-free text is final.
         if function_call_parts:
             if text_parts:
-                blurb = "".join(text_parts).strip()
+                blurb = " ".join(text_parts).strip()
                 if blurb:
-                    print(f"  [thinking] {blurb[:200]}{'...' if len(blurb) > 200 else ''}")
+                    print(f"  {C.magenta('thinking')}")
+                    print(_wrap(C.grey(blurb), indent=4))
+                    print()
 
-            tool_result_parts = []
+            tool_results = []
             for part in function_call_parts:
-                result_content = call_function(part.function_call, verbose)
-                tool_result_parts.append(result_content.parts[0])
+                rc = call_function(part.function_call, verbose)
+                tool_results.append(rc.parts[0])
+            print()
+            messages.append(types.Content(role="user", parts=tool_results))
 
-            messages.append(types.Content(role="user", parts=tool_result_parts))
-
-        # ── Pure text only (zero function calls) → task is complete ──────────
+        # ── Branch B: pure text = done ────────────────────────────────────────
         elif text_parts:
-            final_text = "".join(text_parts).strip()
-            print(f"\n{'─'*60}")
-            print("Agent complete:")
-            print(f"{'─'*60}")
-            print(final_text)
+            elapsed = time.monotonic() - start
+            summary = "\n".join(text_parts).strip()
+
+            print()
+            print(C.grey("─" * WIDTH))
+            print(f"  {C.b_green('✓ Complete')}  {C.grey(f'{elapsed:.1f}s · {iteration} step' + ('s' if iteration != 1 else ''))}")
+            print(C.grey("─" * WIDTH))
+            for para in summary.split("\n"):
+                if para.strip():
+                    print(_wrap(para, indent=2))
+                else:
+                    print()
+            print(C.grey("─" * WIDTH))
             break
 
-        # ── Neither → unexpected empty response ──────────────────────────────
+        # ── Branch C: empty ───────────────────────────────────────────────────
         else:
-            print("[Warning] Model returned no text and no function calls. Stopping.")
+            print(f"\n  {C.yellow('⚠')}  Empty response — no text or tool calls. Stopping.\n")
             break
     else:
-        print(f"\n[Warning] Reached maximum iterations ({max_iterations}). Task may be incomplete.")
+        elapsed = time.monotonic() - start
+        print(f"\n  {C.yellow('⚠')}  Reached {max_iterations} iterations ({elapsed:.1f}s). Task may be incomplete.\n")
 
 
 # ─────────────────────────── Interactive REPL ─────────────────────────────────
 
-def run_interactive(client: genai.Client, model: str, verbose: bool) -> None:
-    """A simple multi-turn REPL so the user can keep refining the project."""
-    print("\n Coding Agent — Interactive Mode")
-    print("Type your request and press Enter. Type 'exit' or 'quit' to stop.\n")
+def run_interactive(client, model: str, verbose: bool) -> None:
+    print()
+    print(C.grey("─" * WIDTH))
+    print(f"  {C.b_blue('◆ Coding Agent')}  {C.grey('interactive · ' + model)}")
+    print(C.grey("─" * WIDTH))
+    print(f"  {C.grey('Describe the project you want to build.')}")
+    print(f"  {C.grey('Commands:')}  {C.grey('exit  quit  clear')}")
+    print(C.grey("─" * WIDTH))
+    print()
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = input(f"  {C.b_green('❯')} ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
+            print(f"\n  {C.grey('Goodbye!')}\n")
             break
 
         if not user_input:
             continue
         if user_input.lower() in ("exit", "quit"):
-            print("Goodbye!")
+            print(f"  {C.grey('Goodbye!')}\n")
             break
+        if user_input.lower() == "clear":
+            os.system("clear" if os.name != "nt" else "cls")
+            continue
 
         run_agent(client, user_input, model, verbose)
         print()
 
+
+# ─────────────────────────── Entry Point ──────────────────────────────────────
+
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Coding Agent — iteratively builds projects using Gemini + tools"
+    p = argparse.ArgumentParser(
+        description="Coding Agent — builds projects iteratively with Gemini",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+            examples:
+            python agentic.py                                         # interactive REPL
+            python agentic.py -p "Build a FastAPI app with SQLite"   # one-shot
+            python agentic.py -p "..." -v                            # verbose output
+            python agentic.py -p "..." --max-iterations 50
+        """,
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model name")
-    parser.add_argument("--prompt", "-p", help="One-shot prompt; omit for interactive mode")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Show token counts and full tool responses")
-    parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS,
-                        help=f"Max agentic loop iterations (default {MAX_ITERATIONS})")
-    return parser.parse_args()
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--prompt", "-p",   help="One-shot prompt (omit for REPL)")
+    p.add_argument("--verbose", "-v",  action="store_true", help="Full token counts + tool output")
+    p.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
+    return p.parse_args()
 
 
 if __name__ == "__main__":
@@ -384,13 +448,12 @@ if __name__ == "__main__":
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        sys.exit("[Error] GEMINI_API_KEY not set. Add it to your .env file or environment.")
+        print(f"\n  {C.red('✗')} GEMINI_API_KEY not set. Add it to .env or your environment.\n")
+        sys.exit(1)
 
     client = genai.Client(api_key=api_key)
 
     if args.prompt:
-        # One-shot mode
         run_agent(client, args.prompt, args.model, args.verbose, args.max_iterations)
     else:
-        # Interactive REPL
         run_interactive(client, args.model, args.verbose)
