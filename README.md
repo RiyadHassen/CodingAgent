@@ -17,8 +17,18 @@ Quick start
 -----------
 Clone or open the repository and run the CLI from the project root.
 
-Run the CLI help:
+Sample run
 
+```
+python agent.py --prompt  "Build a FastAPI REST API With SQLite for inventory servies"
+```
+
+Sample run
+```
+python agent.py --prompt  "I want to build a transformer based  nanogpt model using pytorch and want to train the model and made inference for character level prediction, build me the model and training pipline and write a training script and sample inference script to load and run sample infernce"
+```
+
+Run the CLI help:
 ```bash
 PYTHONPATH=./agenticai python agenticai/agent.py --help
 ```
