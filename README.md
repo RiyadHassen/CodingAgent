@@ -20,51 +20,38 @@ Clone or open the repository and run the CLI from the project root.
 Run the CLI help:
 
 ```bash
-PYTHONPATH=./agenticai python agenticai/main.py --help
+PYTHONPATH=./agenticai python agenticai/agent.py --help
 ```
 
-Examples
---------
-- List the top-level files in the project:
-
-```bash
-PYTHONPATH=./agenticai python agenticai/main.py list
-```
 
 - Read a file (up to the configured limit):
 
 ```bash
-PYTHONPATH=./agenticai python agenticai/main.py read calculator/pkg/calculator.py
+PYTHONPATH=./agenticai python agenticai/agent.py read calculator/pkg/calculator.py
 ```
 
 - Write a file from a string:
 
 ```bash
-PYTHONPATH=./agenticai python agenticai/main.py write notes/new.txt --content "Hello from AgenticAI"
+PYTHONPATH=./agenticai python agenticai/agent.py write notes/new.txt --content "Hello from AgenticAI"
 ```
 
 - Write a file from stdin:
 
 ```bash
-echo "print(123)" | PYTHONPATH=./agenticai python agenticai/main.py write scripts/print.py --stdin
+echo "print(123)" | PYTHONPATH=./agenticai python agenticai/agent.py write scripts/print.py --stdin
 ```
 
 - Run a python file inside the project:
 
 ```bash
-PYTHONPATH=./agenticai python agenticai/main.py runfile calculator/main.py
+PYTHONPATH=./agenticai python agenticai/agent.py runfile calculator/main.py
 ```
 
 - Run ad-hoc Python code (from argument):
 
 ```bash
-PYTHONPATH=./agenticai python agenticai/main.py runcode --code "print('hi from temp')"
-```
-
-- Run ad-hoc Python code (from stdin):
-
-```bash
-echo "print('hi from stdin')" | PYTHONPATH=./agenticai python agenticai/main.py runcode --stdin
+PYTHONPATH=./agenticai python agenticai/agent.py runcode --code "print('hi from temp')"
 ```
 
 Docker
@@ -85,7 +72,7 @@ Notes and security
 
 Development
 -----------
-- The CLI entrypoint is `agenticai/main.py`.
+- The CLI entrypoint is `agenticai/agent.py`.
 - Helpers live in `agenticai/functions/`.
 - To run tests or add more functionality, consider adding `pytest` and a `tests/` directory.
 
