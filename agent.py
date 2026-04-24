@@ -17,9 +17,6 @@ from functions.write_file import write_file, schema_write_file
 from functions.get_files_info import get_files_info, schema_get_files_info
 from functions.run_python_file import run_python_file, schema_run_python_file
 
-
-# ─────────────────────────── ANSI colour helpers ──────────────────────────────
-
 class C:
     _tty = sys.stdout.isatty()
     @staticmethod
@@ -50,10 +47,8 @@ TOOL_ICONS = {
 }
 
 WIDTH = 64
-
-# ─────────────────────────── Configuration ────────────────────────────────────
-
 WORKING_DIRECTORY = os.path.abspath(".")
+ROOT_DIRECTORY    = WORKING_DIRECTORY  # sandbox ceiling — agent cannot escape above this
 DEFAULT_MODEL     = "gemini-2.5-pro"
 MAX_ITERATIONS    = 30
 
@@ -87,7 +82,6 @@ CRITICAL RULES:
   8 .Finally use Write README for the project.
 """
 
-# ─────────────────────────── Tool Implementations ─────────────────────────────
 
 def run_bash_command(command: str, working_directory: str, timeout: int = 30) -> str:
     try:
@@ -131,10 +125,12 @@ def create_directory(path: str, working_directory: str) -> str:
     except Exception as e:
         return f"[Error] {e}"
 def change_directory(path: str, working_directory: str) -> str:
-    """Switch the agent working directory to path (relative or absolute)."""
     global WORKING_DIRECTORY
     candidate = path if os.path.isabs(path) else os.path.join(working_directory, path)
     candidate = os.path.normpath(candidate)
+    # Prevent escaping above the original root directory
+    if not candidate.startswith(ROOT_DIRECTORY):
+        return f"[Error] Cannot navigate outside the workspace root: {ROOT_DIRECTORY}"
     if not os.path.isdir(candidate):
         return f"[Error] Not a directory: {candidate}"
     WORKING_DIRECTORY = candidate
@@ -147,7 +143,6 @@ def install_package(package: str, working_directory: str) -> str:
                        capture_output=True, text=True)
     return (r.stdout + r.stderr) or "(no output)"
 
-# ─────────────────────────── Tool Schemas ─────────────────────────────────────
 
 schema_run_bash_command = types.FunctionDeclaration(
     name="run_bash_command",
@@ -202,7 +197,6 @@ schema_change_directory = types.FunctionDeclaration(
     }, required=["path"]),
 )
 
-# ─────────────────────────── Dispatcher ───────────────────────────────────────
 
 FUNCTION_MAP = {
     "get_files_info":           get_files_info,
@@ -296,8 +290,6 @@ def call_function(func_call, verbose: bool = False) -> types.Content:
     ])
 
 
-# ─────────────────────────── Agent Loop ───────────────────────────────────────
-
 def run_agent(client, user_prompt: str, model: str, verbose: bool,
               max_iterations: int = MAX_ITERATIONS) -> None:
     messages = [types.Content(role="user", parts=[types.Part(text=user_prompt)])]
@@ -306,8 +298,6 @@ def run_agent(client, user_prompt: str, model: str, verbose: bool,
         system_instruction=SYSTEM_PROMPT,
         candidate_count=1,  # always 1; we use candidates[0] deterministically
     )
-
-    # ── Session header ────────────────────────────────────────────────────────
     print()
     print(C.grey("─" * WIDTH))
     print(f"  {C.b_blue('◆ Coding Agent')}  {C.grey(model)}")
@@ -336,16 +326,14 @@ def run_agent(client, user_prompt: str, model: str, verbose: bool,
             m = response.usage_metadata
             print(C.grey(f" ↳ {m.prompt_token_count} prompt tokens / {m.candidates_token_count} response tokens"))
 
-        # ── Parse candidate[0] parts ──────────────────────────────────────────
         # We always use candidates[0] — see call_function docstring for rationale.
-        candidate           = response.candidates[0]
+        candidate = response.candidates[0]
         messages.append(candidate.content)
 
         function_call_parts = [p for p in candidate.content.parts if p.function_call is not None]
         text_parts          = [p.text for p in candidate.content.parts
                                if p.text is not None and p.function_call is None]
 
-        # ── Branch A: tool calls ───────────────────────────────────────────────
         # Text alongside a tool call = model reasoning, shown as "thinking".
         # We NEVER treat this as the final answer — only tool-free text is final.
         if function_call_parts:
@@ -363,7 +351,6 @@ def run_agent(client, user_prompt: str, model: str, verbose: bool,
             print()
             messages.append(types.Content(role="user", parts=tool_results))
 
-        # ── Branch B: pure text = done ────────────────────────────────────────
         elif text_parts:
             elapsed = time.monotonic() - start
             summary = "\n".join(text_parts).strip()
@@ -380,7 +367,6 @@ def run_agent(client, user_prompt: str, model: str, verbose: bool,
             print(C.grey("─" * WIDTH))
             break
 
-        # ── Branch C: empty ───────────────────────────────────────────────────
         else:
             print(f"\n  {C.yellow('⚠')}  Empty response — no text or tool calls. Stopping.\n")
             break
@@ -389,7 +375,6 @@ def run_agent(client, user_prompt: str, model: str, verbose: bool,
         print(f"\n  {C.yellow('⚠')}  Reached {max_iterations} iterations ({elapsed:.1f}s). Task may be incomplete.\n")
 
 
-# ─────────────────────────── Interactive REPL ─────────────────────────────────
 
 def run_interactive(client, model: str, verbose: bool) -> None:
     print()
@@ -419,9 +404,6 @@ def run_interactive(client, model: str, verbose: bool) -> None:
 
         run_agent(client, user_input, model, verbose)
         print()
-
-
-# ─────────────────────────── Entry Point ──────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(

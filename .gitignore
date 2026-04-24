@@ -8,4 +8,19 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets — never commit
 .env
+*.env
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Agent-generated output
+working_dir/
+
+# OS noise
+.DS_Store
+Thumbs.db
